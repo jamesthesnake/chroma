@@ -1,6 +1,4 @@
 from chromadb.api.types import Documents, Embeddings, IDs, Metadatas
-from chromadb.db import DB
-from chromadb.db.index.hnswlib import Hnswlib
 from chromadb.db.clickhouse import (
     Clickhouse,
     db_array_schema_to_clickhouse_schema,
@@ -13,11 +11,11 @@ import pandas as pd
 import json
 import duckdb
 import uuid
-import time
-import itertools
+import os
 import logging
 
 logger = logging.getLogger(__name__)
+
 
 def clickhouse_to_duckdb_schema(table_schema):
     for item in table_schema:
@@ -43,16 +41,12 @@ class DuckDB(Clickhouse):
     # duckdb has a different way of connecting to the database
     def __init__(self, settings):
 
-        logger.warning("Using embedded DuckDB without persistence: data will be transient")
-
         self._conn = duckdb.connect()
         self._create_table_collections()
         self._create_table_embeddings()
-        self._idx = Hnswlib(settings)
         self._settings = settings
 
         # https://duckdb.org/docs/extensions/overview
-        self._conn.execute("INSTALL 'json';")
         self._conn.execute("LOAD 'json';")
 
     def _create_table_collections(self):
@@ -74,9 +68,9 @@ class DuckDB(Clickhouse):
     #  UTILITY METHODS
     #
     def get_collection_uuid_from_name(self, name):
-        return self._conn.execute(
-            f"""SELECT uuid FROM collections WHERE name = ?""", [name]
-        ).fetchall()[0][0]
+        return self._conn.execute("SELECT uuid FROM collections WHERE name = ?", [name]).fetchall()[
+            0
+        ][0]
 
     #
     #  COLLECTION METHODS
@@ -87,34 +81,42 @@ class DuckDB(Clickhouse):
         # poor man's unique constraint
         dupe_check = self.get_collection(name)
         if len(dupe_check) > 0:
-            if get_or_create == True:
-                logger.info(f"collection with name {name} already exists, returning existing collection")
+            if get_or_create is True:
+                logger.info(
+                    f"collection with name {name} already exists, returning existing collection"
+                )
                 return dupe_check
             else:
                 raise ValueError(f"Collection with name {name} already exists")
 
+        collection_uuid = uuid.uuid4()
         self._conn.execute(
-            f"""INSERT INTO collections (uuid, name, metadata) VALUES (?, ?, ?)""",
-            [str(uuid.uuid4()), name, json.dumps(metadata)],
+            """INSERT INTO collections (uuid, name, metadata) VALUES (?, ?, ?)""",
+            [str(collection_uuid), name, json.dumps(metadata)],
         )
-        return [[str(uuid.uuid4()), name, metadata]]
+        return [[str(collection_uuid), name, metadata]]
 
     def get_collection(self, name: str) -> Sequence:
-        res = self._conn.execute(f"""SELECT * FROM collections WHERE name = ?""", [name]).fetchall()
+        res = self._conn.execute("""SELECT * FROM collections WHERE name = ?""", [name]).fetchall()
         # json.loads the metadata
         return [[x[0], x[1], json.loads(x[2])] for x in res]
 
+    def get_collection_by_id(self, uuid: str) -> Sequence:
+        res = self._conn.execute("""SELECT * FROM collections WHERE uuid = ?""", [uuid]).fetchone()
+        return [res[0], res[1], json.loads(res[2])]
+
     def list_collections(self) -> Sequence:
-        res = self._conn.execute(f"""SELECT * FROM collections""").fetchall()
+        res = self._conn.execute("""SELECT * FROM collections""").fetchall()
         return [[x[0], x[1], json.loads(x[2])] for x in res]
 
     def delete_collection(self, name: str):
         collection_uuid = self.get_collection_uuid_from_name(name)
         self._conn.execute(
-            f"""DELETE FROM embeddings WHERE collection_uuid = ?""", [collection_uuid]
+            """DELETE FROM embeddings WHERE collection_uuid = ?""", [collection_uuid]
         )
-        self._idx.delete_index(collection_uuid)
-        self._conn.execute(f"""DELETE FROM collections WHERE name = ?""", [name])
+
+        self._delete_index(collection_uuid)
+        self._conn.execute("""DELETE FROM collections WHERE name = ?""", [name])
 
     def update_collection(
         self, current_name: str, new_name: str, new_metadata: Optional[Dict] = None
@@ -125,7 +127,7 @@ class DuckDB(Clickhouse):
             new_metadata = self.get_collection(current_name)[0][2]
 
         self._conn.execute(
-            f"""UPDATE collections SET name = ?, metadata = ? WHERE name = ?""",
+            """UPDATE collections SET name = ?, metadata = ? WHERE name = ?""",
             [new_name, json.dumps(new_metadata), current_name],
         )
 
@@ -279,11 +281,11 @@ class DuckDB(Clickhouse):
 
         update_fields = []
         if embeddings is not None:
-            update_fields.append(f"embedding = ?")
+            update_fields.append("embedding = ?")
         if metadatas is not None:
-            update_fields.append(f"metadata = ?")
+            update_fields.append("metadata = ?")
         if documents is not None:
-            update_fields.append(f"document = ?")
+            update_fields.append("document = ?")
 
         update_statement = f"""
         UPDATE
@@ -296,7 +298,7 @@ class DuckDB(Clickhouse):
         """
         self._conn.executemany(update_statement, update_data)
 
-    def _delete(self, where_str: Optional[str] = None):
+    def _delete(self, where_str: Optional[str] = None) -> List:
         uuids_deleted = self._conn.execute(
             f"""SELECT uuid FROM embeddings {where_str}"""
         ).fetchall()
@@ -347,12 +349,11 @@ class DuckDB(Clickhouse):
         self._create_table_collections()
         self._create_table_embeddings()
 
-        self._idx.reset()
-        self._idx = Hnswlib(self._settings)
+        self.reset_indexes()
 
     def __del__(self):
         logger.info("Exiting: Cleaning up .chroma directory")
-        self._idx.reset()
+        self.reset_indexes()
 
     def persist(self):
         raise NotImplementedError(
@@ -384,12 +385,15 @@ class PersistentDuckDB(DuckDB):
         """
         Persist the database to disk
         """
-        logger.info("Persisting DB to disk, putting it in the save folder", self._save_folder)
+        logger.info(f"Persisting DB to disk, putting it in the save folder: {self._save_folder}")
         if self._conn is None:
             return
 
+        if not os.path.exists(self._save_folder):
+            os.makedirs(self._save_folder)
+
         # if the db is empty, dont save
-        if self._conn.query(f"SELECT COUNT() FROM embeddings") == 0:
+        if self._conn.query("SELECT COUNT() FROM embeddings") == 0:
             return
 
         self._conn.execute(
@@ -414,7 +418,8 @@ class PersistentDuckDB(DuckDB):
         """
         Load the database from disk
         """
-        import os
+        if not os.path.exists(self._save_folder):
+            os.makedirs(self._save_folder)
 
         # load in the embeddings
         if not os.path.exists(f"{self._save_folder}/chroma-embeddings.parquet"):
