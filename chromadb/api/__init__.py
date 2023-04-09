@@ -1,10 +1,8 @@
 from abc import ABC, abstractmethod
-from typing import Callable, Union, Sequence, Optional, TypedDict, List, Dict
-from uuid import UUID
+from typing import Callable, Union, Sequence, Optional, Dict
 import pandas as pd
 from chromadb.api.models.Collection import Collection
 from chromadb.api.types import (
-    ID,
     Documents,
     Embeddings,
     IDs,
@@ -15,12 +13,13 @@ from chromadb.api.types import (
     GetResult,
     WhereDocument,
 )
-import json
+
+from chromadb.telemetry import Telemetry
 
 
 class API(ABC):
     @abstractmethod
-    def __init__(self):
+    def __init__(self, telemetry_client: Telemetry):
         pass
 
     @abstractmethod

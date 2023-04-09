@@ -9,18 +9,19 @@ from chromadb.api.types import (
     Where,
     WhereDocument,
 )
-from chromadb.errors import NoDatapointsException
 import pandas as pd
 import requests
 import json
 from typing import Sequence
 from chromadb.api.models.Collection import Collection
+from chromadb.telemetry import Telemetry
 
 
 class FastAPI(API):
-    def __init__(self, settings):
+    def __init__(self, settings, telemetry_client: Telemetry):
         url_prefix = "https" if settings.chroma_server_ssl_enabled else "http"
         self._api_url = f"{url_prefix}://{settings.chroma_server_host}:{settings.chroma_server_http_port}/api/v1"
+        self._telemetry_client = telemetry_client
 
     def heartbeat(self):
         """Returns the current server time in nanoseconds to check if the server is alive"""
@@ -190,7 +191,7 @@ class FastAPI(API):
 
         try:
             resp.raise_for_status()
-        except requests.HTTPError as e:
+        except requests.HTTPError:
             raise (Exception(resp.text))
 
         return True
@@ -249,7 +250,7 @@ class FastAPI(API):
 
         try:
             resp.raise_for_status()
-        except requests.HTTPError as e:
+        except requests.HTTPError:
             raise (Exception(resp.text))
 
         body = resp.json()
@@ -278,6 +279,12 @@ class FastAPI(API):
         resp = requests.post(self._api_url + "/collections/" + collection_name + "/create_index")
         try:
             resp.raise_for_status()
-        except requests.HTTPError as e:
+        except requests.HTTPError:
             raise (Exception(resp.text))
+        return resp.json()
+
+    def get_version(self):
+        """Returns the version of the server"""
+        resp = requests.get(self._api_url + "/version")
+        resp.raise_for_status()
         return resp.json()
