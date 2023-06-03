@@ -1,3 +1,5 @@
+# type: ignore
+from chromadb.config import System
 from chromadb.api.types import Documents, Embeddings, IDs, Metadatas
 from chromadb.db.clickhouse import (
     Clickhouse,
@@ -6,13 +8,17 @@ from chromadb.db.clickhouse import (
     db_schema_to_keys,
     COLLECTION_TABLE_SCHEMA,
 )
-from typing import List, Optional, Sequence, Dict
+from typing import List, Optional, Sequence
 import pandas as pd
 import json
 import duckdb
 import uuid
 import os
 import logging
+import atexit
+from uuid import UUID
+from overrides import override
+from chromadb.api.types import Metadata
 
 logger = logging.getLogger(__name__)
 
@@ -39,26 +45,31 @@ def clickhouse_to_duckdb_schema(table_schema):
 # to a third superclass they both extend would be preferable.
 class DuckDB(Clickhouse):
     # duckdb has a different way of connecting to the database
-    def __init__(self, settings):
-
+    def __init__(self, system: System):
         self._conn = duckdb.connect()
-        self._create_table_collections()
-        self._create_table_embeddings()
-        self._settings = settings
+        self._create_table_collections(self._conn)
+        self._create_table_embeddings(self._conn)
+        self._settings = system.settings
+
+        # Normally this would be handled by super(), but we actually can't invoke
+        # super().__init__ here because we're (incorrectly) inheriting from Clickhouse
+        self._dependencies = set()
 
         # https://duckdb.org/docs/extensions/overview
         self._conn.execute("LOAD 'json';")
 
-    def _create_table_collections(self):
-        self._conn.execute(
+    @override
+    def _create_table_collections(self, conn):
+        conn.execute(
             f"""CREATE TABLE collections (
             {db_array_schema_to_clickhouse_schema(clickhouse_to_duckdb_schema(COLLECTION_TABLE_SCHEMA))}
         ) """
         )
 
     # duckdb has different types, so we want to convert the clickhouse schema to duckdb schema
-    def _create_table_embeddings(self):
-        self._conn.execute(
+    @override
+    def _create_table_embeddings(self, conn):
+        conn.execute(
             f"""CREATE TABLE embeddings (
             {db_array_schema_to_clickhouse_schema(clickhouse_to_duckdb_schema(EMBEDDING_TABLE_SCHEMA))}
         ) """
@@ -67,21 +78,32 @@ class DuckDB(Clickhouse):
     #
     #  UTILITY METHODS
     #
-    def get_collection_uuid_from_name(self, name):
-        return self._conn.execute("SELECT uuid FROM collections WHERE name = ?", [name]).fetchall()[
-            0
-        ][0]
+    @override
+    def get_collection_uuid_from_name(self, collection_name: str) -> UUID:
+        return self._conn.execute(
+            "SELECT uuid FROM collections WHERE name = ?", [collection_name]
+        ).fetchall()[0][0]
 
     #
     #  COLLECTION METHODS
     #
+    @override
     def create_collection(
-        self, name: str, metadata: Optional[Dict] = None, get_or_create: bool = False
+        self,
+        name: str,
+        metadata: Optional[Metadata] = None,
+        get_or_create: bool = False,
     ) -> Sequence:
         # poor man's unique constraint
         dupe_check = self.get_collection(name)
         if len(dupe_check) > 0:
             if get_or_create is True:
+                if dupe_check[0][2] != metadata:
+                    self.update_collection(
+                        dupe_check[0][0], new_name=name, new_metadata=metadata
+                    )
+                    dupe_check = self.get_collection(name)
+
                 logger.info(
                     f"collection with name {name} already exists, returning existing collection"
                 )
@@ -96,19 +118,27 @@ class DuckDB(Clickhouse):
         )
         return [[str(collection_uuid), name, metadata]]
 
+    @override
     def get_collection(self, name: str) -> Sequence:
-        res = self._conn.execute("""SELECT * FROM collections WHERE name = ?""", [name]).fetchall()
+        res = self._conn.execute(
+            """SELECT * FROM collections WHERE name = ?""", [name]
+        ).fetchall()
         # json.loads the metadata
         return [[x[0], x[1], json.loads(x[2])] for x in res]
 
-    def get_collection_by_id(self, uuid: str) -> Sequence:
-        res = self._conn.execute("""SELECT * FROM collections WHERE uuid = ?""", [uuid]).fetchone()
+    @override
+    def get_collection_by_id(self, collection_uuid: str):
+        res = self._conn.execute(
+            """SELECT * FROM collections WHERE uuid = ?""", [collection_uuid]
+        ).fetchone()
         return [res[0], res[1], json.loads(res[2])]
 
+    @override
     def list_collections(self) -> Sequence:
         res = self._conn.execute("""SELECT * FROM collections""").fetchall()
         return [[x[0], x[1], json.loads(x[2])] for x in res]
 
+    @override
     def delete_collection(self, name: str):
         collection_uuid = self.get_collection_uuid_from_name(name)
         self._conn.execute(
@@ -118,24 +148,35 @@ class DuckDB(Clickhouse):
         self._delete_index(collection_uuid)
         self._conn.execute("""DELETE FROM collections WHERE name = ?""", [name])
 
+    @override
     def update_collection(
-        self, current_name: str, new_name: str, new_metadata: Optional[Dict] = None
+        self,
+        id: UUID,
+        new_name: Optional[str] = None,
+        new_metadata: Optional[Metadata] = None,
     ):
-        if new_name is None:
-            new_name = current_name
-        if new_metadata is None:
-            new_metadata = self.get_collection(current_name)[0][2]
+        if new_name is not None:
+            dupe_check = self.get_collection(new_name)
+            if len(dupe_check) > 0 and dupe_check[0][0] != str(id):
+                raise ValueError(f"Collection with name {new_name} already exists")
 
-        self._conn.execute(
-            """UPDATE collections SET name = ?, metadata = ? WHERE name = ?""",
-            [new_name, json.dumps(new_metadata), current_name],
-        )
+            self._conn.execute(
+                """UPDATE collections SET name = ? WHERE uuid = ?""",
+                [new_name, id],
+            )
+
+        if new_metadata is not None:
+            self._conn.execute(
+                """UPDATE collections SET metadata = ? WHERE uuid = ?""",
+                [json.dumps(new_metadata), id],
+            )
 
     #
     #  ITEM METHODS
     #
     # the execute many syntax is different than clickhouse, the (?,?) syntax is different than clickhouse
-    def add(self, collection_uuid, embeddings, metadatas, documents, ids):
+    @override
+    def add(self, collection_uuid, embeddings, metadatas, documents, ids) -> List[UUID]:
         data_to_insert = [
             [
                 collection_uuid,
@@ -158,34 +199,46 @@ class DuckDB(Clickhouse):
 
         return [uuid.UUID(x[1]) for x in data_to_insert]  # return uuids
 
-    def _count(self, collection_uuid):
-        where_string = f"WHERE collection_uuid = '{collection_uuid}'"
-        return self._conn.query(f"SELECT COUNT() FROM embeddings {where_string}")
+    @override
+    def count(self, collection_id: UUID) -> int:
+        where_string = f"WHERE collection_uuid = '{collection_id}'"
+        return self._conn.query(
+            f"SELECT COUNT() FROM embeddings {where_string}"
+        ).fetchall()[0][0]
 
-    def count(self, collection_name=None):
-        collection_uuid = self.get_collection_uuid_from_name(collection_name)
-        return self._count(collection_uuid=collection_uuid).fetchall()[0][0]
-
+    @override
     def _format_where(self, where, result):
         for key, value in where.items():
             # Shortcut for $eq
             if type(value) == str:
                 result.append(f" json_extract_string(metadata,'$.{key}') = '{value}'")
             if type(value) == int:
-                result.append(f" CAST(json_extract(metadata,'$.{key}') AS INT) = {value}")
+                result.append(
+                    f" CAST(json_extract(metadata,'$.{key}') AS INT) = {value}"
+                )
             if type(value) == float:
-                result.append(f" CAST(json_extract(metadata,'$.{key}') AS DOUBLE) = {value}")
+                result.append(
+                    f" CAST(json_extract(metadata,'$.{key}') AS DOUBLE) = {value}"
+                )
             # Operator expression
             elif type(value) == dict:
                 operator, operand = list(value.items())[0]
                 if operator == "$gt":
-                    result.append(f" CAST(json_extract(metadata,'$.{key}') AS DOUBLE) > {operand}")
+                    result.append(
+                        f" CAST(json_extract(metadata,'$.{key}') AS DOUBLE) > {operand}"
+                    )
                 elif operator == "$lt":
-                    result.append(f" CAST(json_extract(metadata,'$.{key}') AS DOUBLE) < {operand}")
+                    result.append(
+                        f" CAST(json_extract(metadata,'$.{key}') AS DOUBLE) < {operand}"
+                    )
                 elif operator == "$gte":
-                    result.append(f" CAST(json_extract(metadata,'$.{key}') AS DOUBLE) >= {operand}")
+                    result.append(
+                        f" CAST(json_extract(metadata,'$.{key}') AS DOUBLE) >= {operand}"
+                    )
                 elif operator == "$lte":
-                    result.append(f" CAST(json_extract(metadata,'$.{key}') AS DOUBLE) <= {operand}")
+                    result.append(
+                        f" CAST(json_extract(metadata,'$.{key}') AS DOUBLE) <= {operand}"
+                    )
                 elif operator == "$ne":
                     if type(operand) == str:
                         return result.append(
@@ -215,8 +268,11 @@ class DuckDB(Clickhouse):
                 elif key == "$and":
                     result.append(f"({' AND '.join(all_subresults)})")
                 else:
-                    raise ValueError(f"Operator {key} not supported with a list of where clauses")
+                    raise ValueError(
+                        f"Operator {key} not supported with a list of where clauses"
+                    )
 
+    @override
     def _format_where_document(self, where_document, results):
         operator = list(where_document.keys())[0]
         if operator == "$contains":
@@ -234,6 +290,7 @@ class DuckDB(Clickhouse):
         else:
             raise ValueError(f"Operator {operator} not supported")
 
+    @override
     def _get(self, where, columns: Optional[List] = None):
         select_columns = db_schema_to_keys() if columns is None else columns
         val = self._conn.execute(
@@ -259,6 +316,7 @@ class DuckDB(Clickhouse):
 
         return val
 
+    @override
     def _update(
         self,
         collection_uuid,
@@ -298,6 +356,7 @@ class DuckDB(Clickhouse):
         """
         self._conn.executemany(update_statement, update_data)
 
+    @override
     def _delete(self, where_str: Optional[str] = None) -> List:
         uuids_deleted = self._conn.execute(
             f"""SELECT uuid FROM embeddings {where_str}"""
@@ -311,12 +370,15 @@ class DuckDB(Clickhouse):
         ).fetchall()[0]
         return [uuid.UUID(x[0]) for x in uuids_deleted]
 
-    def get_by_ids(self, ids: List, columns: Optional[List] = None):
+    @override
+    def get_by_ids(
+        self, uuids: List[UUID], columns: Optional[List[str]] = None
+    ) -> Sequence:
         # select from duckdb table where ids are in the list
-        if not isinstance(ids, list):
-            raise TypeError(f"Expected ids to be a list, got {ids}")
+        if not isinstance(uuids, list):
+            raise TypeError(f"Expected ids to be a list, got {uuids}")
 
-        if not ids:
+        if not uuids:
             # create an empty pandas dataframe
             return pd.DataFrame()
 
@@ -330,24 +392,28 @@ class DuckDB(Clickhouse):
             FROM
                 embeddings
             WHERE
-                uuid IN ({','.join([("'" + str(x) + "'") for x in ids])})
+                uuid IN ({','.join([("'" + str(x) + "'") for x in uuids])})
         """
         ).fetchall()
 
         # sort db results by the order of the uuids
-        response = sorted(response, key=lambda obj: ids.index(uuid.UUID(obj[len(columns) - 1])))
+        response = sorted(
+            response, key=lambda obj: uuids.index(uuid.UUID(obj[len(columns) - 1]))
+        )
 
         return response
 
-    def raw_sql(self, sql):
-        return self._conn.execute(sql).df()
+    @override
+    def raw_sql(self, raw_sql):
+        return self._conn.execute(raw_sql).df()
 
     # TODO: This method should share logic with clickhouse impl
+    @override
     def reset(self):
         self._conn.execute("DROP TABLE collections")
         self._conn.execute("DROP TABLE embeddings")
-        self._create_table_collections()
-        self._create_table_embeddings()
+        self._create_table_collections(self._conn)
+        self._create_table_embeddings(self._conn)
 
         self.reset_indexes()
 
@@ -355,7 +421,8 @@ class DuckDB(Clickhouse):
         logger.info("Exiting: Cleaning up .chroma directory")
         self.reset_indexes()
 
-    def persist(self):
+    @override
+    def persist(self) -> None:
         raise NotImplementedError(
             "Set chroma_db_impl='duckdb+parquet' to get persistence functionality"
         )
@@ -364,16 +431,20 @@ class DuckDB(Clickhouse):
 class PersistentDuckDB(DuckDB):
     _save_folder = None
 
-    def __init__(self, settings):
-        super().__init__(settings=settings)
+    def __init__(self, system: System):
+        super().__init__(system=system)
 
-        if settings.persist_directory == ".chroma":
+        system.settings.require("persist_directory")
+
+        if system.settings.persist_directory == ".chroma":
             raise ValueError(
                 "You cannot use chroma's cache directory .chroma/, please set a different directory"
             )
 
-        self._save_folder = settings.persist_directory
+        self._save_folder = system.settings.persist_directory
         self.load()
+        # https://docs.python.org/3/library/atexit.html
+        atexit.register(self.persist)
 
     def set_save_folder(self, path):
         self._save_folder = path
@@ -381,11 +452,14 @@ class PersistentDuckDB(DuckDB):
     def get_save_folder(self):
         return self._save_folder
 
+    @override
     def persist(self):
         """
         Persist the database to disk
         """
-        logger.info(f"Persisting DB to disk, putting it in the save folder: {self._save_folder}")
+        logger.info(
+            f"Persisting DB to disk, putting it in the save folder: {self._save_folder}"
+        )
         if self._conn is None:
             return
 
@@ -426,7 +500,9 @@ class PersistentDuckDB(DuckDB):
             logger.info(f"No existing DB found in {self._save_folder}, skipping load")
         else:
             path = self._save_folder + "/chroma-embeddings.parquet"
-            self._conn.execute(f"INSERT INTO embeddings SELECT * FROM read_parquet('{path}');")
+            self._conn.execute(
+                f"INSERT INTO embeddings SELECT * FROM read_parquet('{path}');"
+            )
             logger.info(
                 f"""loaded in {self._conn.query(f"SELECT COUNT() FROM embeddings").fetchall()[0][0]} embeddings"""
             )
@@ -436,15 +512,18 @@ class PersistentDuckDB(DuckDB):
             logger.info(f"No existing DB found in {self._save_folder}, skipping load")
         else:
             path = self._save_folder + "/chroma-collections.parquet"
-            self._conn.execute(f"INSERT INTO collections SELECT * FROM read_parquet('{path}');")
+            self._conn.execute(
+                f"INSERT INTO collections SELECT * FROM read_parquet('{path}');"
+            )
             logger.info(
                 f"""loaded in {self._conn.query(f"SELECT COUNT() FROM collections").fetchall()[0][0]} collections"""
             )
 
     def __del__(self):
-        logger.info("PersistentDuckDB del, about to run persist")
-        self.persist()
+        # No-op for duckdb with persistence since the base class will delete the indexes
+        pass
 
+    @override
     def reset(self):
         super().reset()
         # empty the save folder
